@@ -336,13 +336,13 @@ def ssd_tuning(
     # load the trained model
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
 
-    ssd = ssd.ParameterPerturber(model, optimizer, device, parameters)
+    ssd_t = ssd.ParameterPerturber(model, optimizer, device, parameters)
     model = model.eval()
 
-    sample_importances = ssd.calc_importance(forget_train_dl)
+    sample_importances = ssd_t.calc_importance(forget_train_dl)
 
-    original_importances = ssd.calc_importance(full_train_dl)
-    ssd.modify_weight(original_importances, sample_importances)
+    original_importances = ssd_t.calc_importance(full_train_dl)
+    ssd_t.modify_weight(original_importances, sample_importances)
     return get_metric_scores(
         model,
         unlearning_teacher,
