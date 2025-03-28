@@ -489,3 +489,99 @@ def mu_mis_ssd_tuning(
         device,
     )
 
+def improved_mu_mis_ssd_tuning(
+    model,
+    unlearning_teacher,
+    retain_train_dl,
+    retain_valid_dl,
+    forget_train_dl,
+    forget_valid_dl,
+    valid_dl,
+    dampening_constant,
+    selection_weighting,
+    full_train_dl,
+    device,
+    **kwargs,
+):
+    max_epochs=20
+    parameters = {
+        "lower_bound": 1,
+        "exponent": 1,
+        "magnitude_diff": None,
+        "min_layer": -1,
+        "max_layer": -1,
+        "forget_threshold": 1,
+        "dampening_constant": dampening_constant,
+        "selection_weighting": selection_weighting,
+    }
+
+    print("🔹 Improved MU MIS SSD Tuning")
+
+    optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=1e-5)
+
+    ssd_t = ssd.ParameterPerturber(model, optimizer, device, parameters)
+    importance_forget = ssd_t.calc_importance(forget_train_dl)
+    importance_full = ssd_t.calc_importance(full_train_dl)
+
+    w_p = deepcopy(model.state_dict())
+    prev_loss = float("inf")
+    delta_threshold = 1e-3  # Stopping criteria
+    epoch = 0
+
+    while epoch < max_epochs:
+        print(f"\n🔄 Epoch {epoch + 1} ----------------------")
+        delta_w = {key: torch.zeros_like(param) for key, param in model.state_dict().items()}
+        fisher_info = {key: torch.zeros_like(param) for key, param in model.state_dict().items()}
+
+        model.train()
+        for batch in forget_train_dl:
+            inputs, _, labels = batch
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = torch.nn.functional.cross_entropy(outputs, labels)
+            loss.backward()
+
+            for key, param in model.named_parameters():
+                hessian_term = 0.5 * torch.norm(param.grad) ** 2  # Hessian Approx
+                fisher_info[key] += torch.norm(param.grad) ** 2  # Fisher Information
+                delta_w[key] += importance_forget[key] * (param.grad + hessian_term)
+
+        print("✅ Gradient updates computed.")
+
+        with torch.no_grad():
+            for key, param in model.named_parameters():
+                fisher_scaling = torch.exp(-fisher_info[key])
+                delta_w[key] *= fisher_scaling  # Adaptive Forgetting Scaling
+                param -= 0.1 * delta_w[key]  # Learning Rate applied
+                param.copy_(torch.clamp(param, -0.5, 0.5))  # Trust Region Constraint
+
+        print("🔧 Model weights updated.")
+        model.eval()
+
+        total_loss = 0.0
+        num_batches = 0
+        with torch.no_grad():
+            for batch in valid_dl:
+                images, _, labels = batch
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss = torch.nn.functional.cross_entropy(outputs, labels)
+                total_loss += loss.item()
+                num_batches += 1
+
+        new_loss = total_loss / num_batches
+        print(f"📉 Validation Loss: {new_loss:.6f} (Previous: {prev_loss:.6f})")
+
+        if abs(prev_loss - new_loss) < delta_threshold:
+            print("✅ Convergence reached. Stopping...")
+            break
+
+        prev_loss = new_loss
+        scheduler.step()
+        epoch += 1
+
+    print("🏁 Training complete.")
+    return get_metric_scores(model, unlearning_teacher, retain_train_dl, retain_valid_dl, forget_train_dl, forget_valid_dl, valid_dl, device)
