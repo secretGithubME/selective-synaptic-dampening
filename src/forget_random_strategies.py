@@ -12,6 +12,8 @@ from copy import deepcopy
 import torch
 from torch.utils.data import DataLoader, ConcatDataset, dataset
 from tqdm import tqdm
+import torch.optim as optim
+import torch.nn.functional as F
 
 from sklearn import linear_model, model_selection
 
@@ -32,13 +34,30 @@ def get_metric_scores(
     valid_dl,
     device,
 ):
-    loss_acc_dict = evaluate(model, valid_dl, device)
-    retain_acc_dict = evaluate(model, retain_valid_dl, device)
+    # Overall test accuracy
+    loss_acc_dict = evaluate(model, valid_dl, device)  
+
+    # Retain set accuracy
+    retain_acc_dict = evaluate(model, retain_valid_dl, device)  
+
+    # Forget set accuracy
+    forget_acc_dict = evaluate(model, forget_valid_dl, device)
+
+    # Zero Retention Force (ZRF) score
     zrf = UnLearningScore(model, unlearning_teacher, forget_valid_dl, 128, device)
-    d_f = evaluate(model, forget_valid_dl, device)
+
+    # Membership Inference Attack (MIA) vulnerability
     mia = get_membership_attack_prob(retain_train_dl, forget_train_dl, valid_dl, model)
 
-    return (loss_acc_dict["Acc"], retain_acc_dict["Acc"], zrf, mia, d_f["Acc"])
+    # Return all metrics including forget accuracy
+    return (
+        loss_acc_dict["Acc"],       # Test Accuracy
+        retain_acc_dict["Acc"],     # Retain Accuracy
+        forget_acc_dict["Acc"],     # Forget Accuracy (newly added)
+        zrf,                        # Unlearning Score
+        mia                         # Membership Attack Score
+    )
+
 
 
 def baseline(
@@ -354,142 +373,7 @@ def ssd_tuning(
         device,
     )
 
-
 def mu_mis_ssd_tuning(
-    model,
-    unlearning_teacher,
-    retain_train_dl,
-    retain_valid_dl,
-    forget_train_dl,
-    forget_valid_dl,
-    valid_dl,
-    dampening_constant,
-    selection_weighting,
-    full_train_dl,
-    device,
-    **kwargs,
-):
-    parameters = {
-        "lower_bound": 1,
-        "exponent": 1,
-        "magnitude_diff": None,
-        "min_layer": -1,
-        "max_layer": -1,
-        "forget_threshold": 1,
-        "dampening_constant": dampening_constant,
-        "selection_weighting": selection_weighting,
-    }
-
-    print("🔹 In MU MIS SSD Tuning")
-
-    # Step 1: Compute and store importance values once
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
-    ssd_t = ssd.ParameterPerturber(model, optimizer, device, parameters)
-
-    # Compute importance of forgetting and retaining samples
-    importance_forget = ssd_t.calc_importance(forget_train_dl)
-    importance_full = ssd_t.calc_importance(full_train_dl)
-
-    # Initialize pretrained weights
-    w_p = deepcopy(model.state_dict())
-
-    # Iterative Unlearning Loop
-    prev_loss = float("inf")
-    delta_threshold = 1e-3  # Stopping criteria
-    epoch = 0
-
-    while True:
-        print(f"\n🔄 Epoch {epoch + 1} ----------------------")
-        
-        delta_w = {key: torch.zeros_like(param) for key, param in model.state_dict().items()}
-
-        # Iterate over the forget set
-        for batch in forget_train_dl:
-            inputs, _, labels = batch
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            # Compute loss and gradients
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = torch.nn.functional.cross_entropy(outputs, labels)
-            loss.backward()
-
-            # Update delta_w with importance scaling
-            for key, param in model.named_parameters():
-                delta_w[key] += importance_forget[key] * param.grad
-        
-        print("✅ Gradient updates computed.")
-
-        # Apply weight update
-        with torch.no_grad():
-            for key, param in model.named_parameters():
-                param -= 0.1 * delta_w[key]  # Learning rate = 0.1
-        
-        print("🔧 Model weights updated.")
-
-        # Compute validation loss manually
-        model.eval()
-        total_loss = 0.0
-        num_batches = 0
-        with torch.no_grad():
-            for batch in valid_dl:
-                images, _, labels = batch
-                images, labels = images.to(device), labels.to(device)
-                
-                outputs = model(images)
-                # Print debug info for labels
-                # print(f"🔹 Labels Shape: {labels.shape}")
-
-                # Fix potential empty tensor issue
-                if labels.ndim > 1 and labels.shape[1] > 1:  # One-hot encoded case
-                    labels = labels.argmax(dim=1)  # Convert to class indices
-                elif labels.ndim > 1:
-                    labels = labels.squeeze()  # Remove extra dimensions
-
-                # Final check
-                # print(f"✅ Processed Labels Shape: {labels.shape}")
-                loss = torch.nn.functional.cross_entropy(outputs, labels)
-                total_loss += loss.item()
-                num_batches += 1
-        
-        new_loss = total_loss / num_batches  # Compute average validation loss
-
-        print(f"📉 Validation Loss: {new_loss:.6f} (Previous: {prev_loss:.6f})")
-
-        # Check stopping condition
-        if abs(prev_loss - new_loss) < delta_threshold:
-            print("✅ Convergence reached. Stopping...")
-            break
-        
-        prev_loss = new_loss  # Update previous loss
-
-        # Apply Dampening
-        with torch.no_grad():
-            for key, param in model.named_parameters():
-                beta_i = torch.clamp(torch.norm(delta_w[key]) / (importance_forget[key] + 1e-8), min=0, max=1)
-                
-                # Fix in-place operation issue
-                param.copy_(param * beta_i)
-
-                if epoch % 10 == 0:  # Print beta values every 10 epochs for monitoring
-                    print(f"🛠️  Beta dampening applied for {key}: {beta_i.mean().item():.4f}")
-
-        epoch += 1  # Increment epoch counter
-
-    print("🏁 Training complete.")
-
-    return get_metric_scores(
-        model,
-        unlearning_teacher,
-        retain_train_dl,
-        retain_valid_dl,
-        forget_train_dl,
-        forget_valid_dl,
-        valid_dl,
-        device,
-    )
-
-def improved_mu_mis_ssd_tuning(
     model,
     unlearning_teacher,
     retain_train_dl,
