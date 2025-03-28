@@ -552,172 +552,119 @@ def mu_mis_ssd_tuning(
     print("🏁 Training complete.")
     return get_metric_scores(model, unlearning_teacher, retain_train_dl, retain_valid_dl, forget_train_dl, forget_valid_dl, valid_dl, device)
 
-
-import torch
-import torch.optim as optim
-import torch.nn.functional as F
-from copy import deepcopy
-
-def cluade(
+def MESD_unlearning(
     model,
-    unlearning_teacher,
     retain_train_dl,
     retain_valid_dl,
     forget_train_dl,
     forget_valid_dl,
     valid_dl,
-    dampening_constant,
-    selection_weighting,
-    full_train_dl,
     device,
-    **kwargs,
+    **kwargs
 ):
     """
-    Combined Machine Unlearning Method:
-    Integrates Selective Synaptic Dampening (SSD) and Suppressing Sample Contribution (SSC)
-    
-    Key Improvements:
-    - More robust importance calculation
-    - Adaptive learning rate
-    - Enhanced regularization
-    - Improved convergence tracking
+    Memory Editing with Self-Distillation (MESD) for machine unlearning.
     """
-    # Hyperparameters
-    max_epochs = kwargs.get('max_epochs', 30)
-    learning_rate = kwargs.get('learning_rate', 0.01)
-    regularization_strength = kwargs.get('regularization_strength', 1e-4)
+    alpha=0.5   # Knowledge drift factor
+    beta=0.1   # Self-distillation weight
+    pruning_threshold=1e-6 # Adaptive neuron pruning threshold
+    num_epochs = 3
     
-    # Detailed parameters for SSD
-    parameters = {
-        "lower_bound": kwargs.get('lower_bound', 1),
-        "exponent": kwargs.get('exponent', 1),
-        "magnitude_diff": kwargs.get('magnitude_diff', None),
-        "min_layer": kwargs.get('min_layer', -1),
-        "max_layer": kwargs.get('max_layer', -1),
-        "forget_threshold": kwargs.get('forget_threshold', 1),
-        "dampening_constant": dampening_constant,
-        "selection_weighting": selection_weighting,
-    }
-
-    print("🔹 Advanced Machine Unlearning: SSD + SSC")
-
-    # Setup optimizer with adaptive learning rate
-    optimizer = optim.Adam(model.parameters(), 
-                           lr=learning_rate, 
-                           weight_decay=regularization_strength)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='min', 
-        factor=0.5, 
-        patience=3, 
-        min_lr=1e-5
-    )
-
-    # Instantiate SSD Parameter Perturber
-    ssd_t = ssd.ParameterPerturber(model, optimizer, device, parameters)
+    print("\n[STEP 1] Training Student Model via Self-Distillation...\n")
     
-    # Calculate importance scores
-    importance_forget = ssd_t.calc_importance(forget_train_dl)
-    importance_full = ssd_t.calc_importance(full_train_dl)
-
-    # Store initial weights for reference
-    initial_weights = deepcopy(model.state_dict())
+    student_model = deepcopy(model)
+    optimizer = torch.optim.Adam(student_model.parameters(), lr=0.0005)
     
-    # Convergence tracking
-    best_loss = float('inf')
-    patience_counter = 0
-    max_patience = 5
-
-    for epoch in range(max_epochs):
-        print(f"\n🔄 Epoch {epoch + 1} ----------------------")
-        
-        # Training phase focusing on forget set
-        model.train()
-        epoch_loss = 0.0
-        total_batches = 0
-
-        for batch in forget_train_dl:
-            inputs, _, labels = batch
-            inputs, labels = inputs.to(device), labels.to(device)
-
+    for epoch in range(num_epochs):  
+        total_loss = 0.0
+        for x,_, y in retain_train_dl:
+            x, y = x.to(device), y.to(device)
+            teacher_logits = model(x).detach()
+            student_logits = student_model(x)
+            
+            loss = F.kl_div(F.log_softmax(student_logits, dim=-1), 
+                            F.softmax(teacher_logits, dim=-1), 
+                            reduction="batchmean") * beta
             optimizer.zero_grad()
-            
-            # Forward pass
-            outputs = model(inputs)
-            
-            # SSC: Suppress sample contribution
-            base_loss = F.cross_entropy(outputs, labels)
-            
-            # SSD: Compute parameter-wise importance loss
-            importance_loss = 0.0
-            for name, param in model.named_parameters():
-                if name in importance_forget:
-                    importance_loss += torch.norm(
-                        param * importance_forget[name], 
-                        p=2
-                    )
-            
-            # Combined loss
-            total_loss = base_loss + dampening_constant * importance_loss
-            
-            # Backward pass
-            total_loss.backward()
-            
-            # Adaptive gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
+            loss.backward()
             optimizer.step()
-            
-            epoch_loss += total_loss.item()
-            total_batches += 1
-
-        # Average epoch loss
-        avg_loss = epoch_loss / total_batches
-        print(f"📉 Epoch Loss: {avg_loss:.6f}")
-
-        # Validation phase
-        model.eval()
-        val_loss = 0.0
-        val_batches = 0
-        with torch.no_grad():
-            for batch in valid_dl:
-                images, _, labels = batch
-                images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                loss = F.cross_entropy(outputs, labels)
-                val_loss += loss.item()
-                val_batches += 1
+            total_loss += loss.item()
         
-        val_loss /= val_batches
-        print(f"🔍 Validation Loss: {val_loss:.6f}")
+        print(f"Epoch {epoch+1}/{num_epochs} - Self-Distillation Loss: {total_loss:.4f}")
 
-        # Learning rate scheduling
-        scheduler.step(val_loss)
+    print("\n[STEP 2] Injecting Controlled Noise for Knowledge Drift...\n")
 
-        # Early stopping with best model tracking
-        if val_loss < best_loss:
-            best_loss = val_loss
-            best_weights = deepcopy(model.state_dict())
-            patience_counter = 0
-        else:
-            patience_counter += 1
+    # Store original weights before modification
+    original_params = {name: p.clone().detach() for name, p in student_model.named_parameters()}
 
-        # Convergence and early stopping
-        if patience_counter >= max_patience:
-            print("🛑 Early stopping triggered")
-            model.load_state_dict(best_weights)
-            break
+    with torch.no_grad():
+        for p in student_model.parameters():
+            noise = alpha * torch.randn_like(p) * p.std()
+            p.add_(noise)
 
-    print("🏁 Advanced Unlearning Complete")
+    # Measure drift
+    total_drift = 0.0
+    for name, p in student_model.named_parameters():
+        drift = torch.norm(p - original_params[name]).item()
+        total_drift += drift
+        print(f"Layer {name}: Weight Drift = {drift:.6f}")
 
-    # Final metric evaluation
+    print(f"\nTotal Model Drift: {total_drift:.6f}\n")
+
+    print("\n[STEP 3] Applying Contrastive Forgetting Loss (CFL)...\n")
+
+    def contrastive_forgetting_loss(model, x_forget, x_retain):
+        forget_feats = model(x_forget)
+        retain_feats = model(x_retain)
+
+        # Ensure both tensors have the same batch size
+        min_size = min(forget_feats.shape[0], retain_feats.shape[0])
+        forget_feats = forget_feats[:min_size]
+        retain_feats = retain_feats[:min_size]
+
+        return -F.cosine_similarity(forget_feats, retain_feats).mean()  # Maximize difference
+
+    forget_batch = next(iter(forget_train_dl))[0].to(device)
+    retain_batch = next(iter(retain_train_dl))[0].to(device)
+    optimizer = torch.optim.Adam(student_model.parameters(), lr=0.0001)
+
+    for epoch in range(2):
+        optimizer.zero_grad()
+        loss = contrastive_forgetting_loss(student_model, forget_batch, retain_batch)
+        loss.backward()
+        optimizer.step()
+        print(f"Epoch {epoch+1}/2 - Contrastive Forgetting Loss: {loss.item():.6f}")
+
+    print("\n[STEP 4] Pruning Neurons Responsible for Forgotten Classes...\n")
+
+    def prune_model(model, threshold=pruning_threshold):
+        prune_count = 0
+        with torch.no_grad():
+            for p in model.parameters():
+                mean_abs = p.abs().mean()
+                if mean_abs < threshold:
+                    prune_count += 1
+                    p.zero_()  # Prune neuron
+        
+        print(f"Total Neurons Pruned: {prune_count}")
+
+    prune_model(student_model)
+
+    print("\n[STEP 5] Generating Pseudo-Examples for Active Misremembering...\n")
+
+    synthetic_data = torch.randn_like(forget_batch) * 0.1 + forget_batch
+    with torch.no_grad():
+        student_model(synthetic_data)  # Feed pseudo-examples into model
+
+    print("MESD Unlearning Completed!\n")
+
     return get_metric_scores(
-        model, 
-        unlearning_teacher, 
-        retain_train_dl, 
-        retain_valid_dl, 
-        forget_train_dl, 
-        forget_valid_dl, 
-        valid_dl, 
-        device
-    )
+        student_model,
+        model,
+        retain_train_dl,
+        retain_valid_dl,
+        forget_train_dl,
+        forget_valid_dl,
+        valid_dl,
+        device,
+    ) 
