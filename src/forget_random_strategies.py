@@ -381,116 +381,79 @@ def mu_mis_unlearning(
     forget_train_dl,
     forget_valid_dl,
     valid_dl,
+    dampening_constant,
+    selection_weighting,
+    full_train_dl,
     device,
-    **kwargs
+    **kwargs,
 ):
-    T_MU = kwargs.get('max_iterations', 100)  # Maximum iterations
-    step_length = kwargs.get('step_length', 0.01)  # Step length η
-    stopping_threshold = kwargs.get('stopping_threshold', 1e-3)  # Stopping threshold δ
-    dataset_name = kwargs.get('dataset_name')
+    step_size=0.01 # η: Step length
+    stop_threshold=0.1  # δ: Stopping threshold
+    max_iterations=10  # TMU: Max iterations
     num_classes = kwargs.get('num_classes')
-    dampening_constant = kwargs.get('dampening_constant')
-    selection_weighting = kwargs.get('selection_weighting')
+    model.train()
+    model = model.to(device)
     
-    print(f"🔹 MU-MIS Unlearning for {dataset_name}")
-    print(f"🔹 Number of Classes: {num_classes}")
-    print(f"🔹 Device: {device}")
-    print(f"🔹 Dampening Constant: {dampening_constant}")
+    # Initialize model parameters
+    wt = model.state_dict()  # w0 = wp
     
-    # Setup optimizer for weight updates
-    optimizer = optim.SGD(model.parameters(), lr=step_length)
+    # Compute initial loss on forgetting set D_f
+    criterion = nn.CrossEntropyLoss()
+    initial_loss = 0.0
+    for x,_, y in forget_train_dl:
+        x, y = x.to(device), y.to(device)
+        preds = model(x)
+        initial_loss += criterion(preds, y).item()
+    L_0 = initial_loss / len(forget_train_dl)  # L̃_0
     
-    # Compute initial loss
-    def compute_initial_loss(dataloader):
-        model.eval()
-        total_loss = 0.0
+    for t in range(max_iterations):  # Repeat until stopping condition
+        print("Epoch: ",t+1)
+        delta_w = {key: torch.zeros_like(param) for key, param in wt.items()}  # Initialize Δw
+        avg_loss = 0.0  # Initialize L̃
+        
+        for x,_,y in forget_train_dl:
+            x, y = x.to(device), y.to(device)
+            
+            # Select a random irrelevant class (c' ≠ c)
+            random_labels = torch.randint(0, num_classes, y.shape, device=device)
+            while torch.any(random_labels == y):  # Ensure c' ≠ c
+                random_labels = torch.randint(0, num_classes, y.shape, device=device)
+            
+            # Compute loss for x with random class
+            preds = model(x)
+            loss = criterion(preds, random_labels)
+            loss.backward()  # Compute gradient
+            
+            # Accumulate gradient updates
+            for key, param in model.named_parameters():
+                delta_w[key] += param.grad.clone()
+            
+            avg_loss += loss.item()
+        
+        # Normalize updates
+        for key in delta_w.keys():
+            delta_w[key] = delta_w[key].float() / len(forget_train_dl)
+        
+        # Update model parameters: wt+1 = wt - ηΔw
         with torch.no_grad():
-            for batch in dataloader:
-                inputs, _, labels = batch
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = F.cross_entropy(outputs, labels)
-                total_loss += loss.item()
-        return total_loss / len(dataloader)
-    
-    # Initial loss on forget dataset
-    L_0 = compute_initial_loss(forget_train_dl)
-    print(f"🔹 Initial Loss on Forget Dataset: {L_0:.6f}")
-    
-    # Main MU-MIS algorithm
-    for t in range(T_MU):
-        print(f"\n🔄 Iteration {t + 1}")
+            for key, param in model.named_parameters():
+                param -= step_size * delta_w[key]
         
-        L_avg = 0.0
+        # Compute loss change: ΔL̃
+        final_loss = 0.0
+        for x,_,y in forget_train_dl:
+            x, y = x.to(device), y.to(device)
+            preds = model(x)
+            final_loss += criterion(preds, y).item()
+        L_final = final_loss / len(forget_train_dl)
+        delta_L = abs(L_0 - L_final) / len(forget_train_dl)
+        print("Final loss: ", final_loss)
         
-        # Iterate through forget dataset
-        for batch in forget_train_dl:
-            inputs, _, labels = batch
-            inputs, labels = inputs.to(device), labels.to(device)
-            
-            # Get unique classes in current batch
-            unique_batch_classes = torch.unique(labels).cpu().numpy()
-            
-            # Find irrelevant classes
-            irrelevant_classes = [
-                c for c in range(num_classes) 
-                if c not in unique_batch_classes
-            ]
-            
-            # If no truly irrelevant classes, use least represented class
-            if not irrelevant_classes:
-                class_counts = {c: torch.sum(labels == c).item() for c in unique_batch_classes}
-                irrelevant_classes = [min(class_counts, key=class_counts.get)]
-            
-            # Randomly select an irrelevant class
-            irrelevant_class = random.choice(irrelevant_classes)
-            
-            # Compute loss
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            
-            # Compute loss for selected irrelevant class
-            irrelevant_labels = torch.full_like(labels, irrelevant_class)
-            base_loss = F.cross_entropy(outputs, irrelevant_labels)
-            
-            # Optional: Add dampening or regularization
-            if selection_weighting is not None:
-                regularization_loss = dampening_constant * selection_weighting * base_loss
-                total_loss = base_loss + regularization_loss
-            else:
-                total_loss = base_loss
-            
-            # Compute and apply gradient
-            total_loss.backward()
-            optimizer.step()
-            
-            L_avg += total_loss.item()
-        
-        # Normalize average loss
-        L_avg /= len(forget_train_dl)
-        
-        # Compute convergence criterion
-        L_c = abs(L_0 - L_avg)
-        print(f"📉 Loss Change: {L_c:.6f}")
-        
-        # Check stopping criterion
-        if L_c <= stopping_threshold:
-            print("✅ Convergence reached")
+        # Stop if ΔL̃ ≥ δ
+        if delta_L >= stop_threshold:
             break
     
-    print("🏁 MU-MIS Unlearning Complete")
-    
-    # Evaluate unlearning performance
-    return get_metric_scores(
-        model, 
-        unlearning_teacher, 
-        retain_train_dl, 
-        retain_valid_dl, 
-        forget_train_dl, 
-        forget_valid_dl, 
-        valid_dl, 
-        device
-    )
+    return get_metric_scores(model, unlearning_teacher, retain_train_dl, retain_valid_dl, forget_train_dl, forget_valid_dl, valid_dl, device)
 
 def mu_mis_ssd_tuning(
     model,
