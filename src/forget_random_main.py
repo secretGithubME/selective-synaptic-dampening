@@ -70,6 +70,7 @@ parser.add_argument(
         "amnesiac",
         "FisherForgetting",
         "ssd_tuning",
+        "mu_mis_ssd_tuning"
     ],
     help="select unlearning method from choice set",
 )
@@ -160,27 +161,26 @@ wandb.init(
 
 # wandb.init(project=f"{args.dataset}_forget_random_{args.forget_perc}", name=f'{args.method}')
 
-import time
-
 start = time.time()
 
-testacc, retainacc, zrf, mia, d_f = getattr(forget_random_strategies, args.method)(
-    **kwargs
-)
+testacc, retainacc, forgetacc, zrf, mia = getattr(forget_random_strategies, args.method)(**kwargs)
+
 end = time.time()
 time_elapsed = end - start
 
-print(testacc, retainacc, zrf, mia)
+print(testacc, retainacc, forgetacc, zrf, mia)
+
 wandb.log(
     {
         "TestAcc": testacc,
         "RetainTestAcc": retainacc,
+        "ForgetAcc": forgetacc,  # Explicitly log Forget Accuracy
         "ZRF": zrf,
         "MIA": mia,
-        "Df": d_f,
         "model_scaler": model_size_scaler,
-        "MethodTime": time_elapsed,  # do not forget to deduct baseline time from it to remove results calc (acc, MIA, ...)
+        "MethodTime": time_elapsed,  # Exclude baseline time if needed
     }
 )
 
 wandb.finish()
+
