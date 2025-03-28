@@ -5,467 +5,184 @@ Seperate file to allow for easy reuse.
 """
 
 import random
-import numpy as np
+import os
+import wandb
+
+# import optuna
 from typing import Tuple, List
-from copy import deepcopy
+import sys
+import argparse
+import time
+from datetime import datetime
 
+import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, ConcatDataset, dataset
-from tqdm import tqdm
 import torch.optim as optim
-import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
 
-from sklearn import linear_model, model_selection
-
+import models
 from unlearn import *
-from metrics import UnLearningScore, get_membership_attack_prob
 from utils import *
-import ssd as ssd
+import forget_random_strategies
+import datasets
+import models
 import conf
+from training_utils import *
 
 
-def get_metric_scores(
-    model,
-    unlearning_teacher,
-    retain_train_dl,
-    retain_valid_dl,
-    forget_train_dl,
-    forget_valid_dl,
-    valid_dl,
-    device,
-):
-    # Overall test accuracy
-    loss_acc_dict = evaluate(model, valid_dl, device)  
+"""
+Get Args
+"""
+parser = argparse.ArgumentParser()
+parser.add_argument("-net", type=str, required=True, help="net type")
+parser.add_argument(
+    "-weight_path",
+    type=str,
+    required=True,
+    help="Path to model weights. If you need to train a new model use pretrain_model.py",
+)
+parser.add_argument(
+    "-dataset",
+    type=str,
+    required=True,
+    nargs="?",
+    choices=["Cifar10", "Cifar20", "Cifar100", "PinsFaceRecognition"],
+    help="dataset to train on",
+)
+parser.add_argument("-classes", type=int, required=True, help="number of classes")
+parser.add_argument("-gpu", action="store_true", default=False, help="use gpu or not")
+parser.add_argument("-b", type=int, default=128, help="batch size for dataloader")
+parser.add_argument("-warm", type=int, default=1, help="warm up training phase")
+parser.add_argument("-lr", type=float, default=0.1, help="initial learning rate")
+parser.add_argument(
+    "-method",
+    type=str,
+    required=True,
+    nargs="?",
+    choices=[
+        "baseline",
+        "retrain",
+        "finetune",
+        "blindspot",
+        "amnesiac",
+        "FisherForgetting",
+        "ssd_tuning",
+        "mu_mis_unlearning",
+        "mu_mis_ssd_tuning",
+        "cluade"
+    ],
+    help="select unlearning method from choice set",
+)
+parser.add_argument(
+    "-forget_perc", type=float, required=True, help="Percentage of trainset to forget"
+)
+parser.add_argument(
+    "-epochs", type=int, default=1, help="number of epochs of unlearning method to use"
+)
+parser.add_argument("-seed", type=int, default=0, help="seed for runs")
+args = parser.parse_args()
 
-    # Retain set accuracy
-    retain_acc_dict = evaluate(model, retain_valid_dl, device)  
-
-    # Forget set accuracy
-    forget_acc_dict = evaluate(model, forget_valid_dl, device)
-
-    # Zero Retention Force (ZRF) score
-    zrf = UnLearningScore(model, unlearning_teacher, forget_valid_dl, 128, device)
-
-    # Membership Inference Attack (MIA) vulnerability
-    mia = get_membership_attack_prob(retain_train_dl, forget_train_dl, valid_dl, model)
-
-    # Return all metrics including forget accuracy
-    return (
-        loss_acc_dict["Acc"],       # Test Accuracy
-        retain_acc_dict["Acc"],     # Retain Accuracy
-        forget_acc_dict["Acc"],     # Forget Accuracy (newly added)
-        zrf,                        # Unlearning Score
-        mia                         # Membership Attack Score
-    )
-
-
-
-def baseline(
-    model,
-    unlearning_teacher,
-    retain_train_dl,
-    retain_valid_dl,
-    forget_train_dl,
-    forget_valid_dl,
-    valid_dl,
-    device,
-    **kwargs,
-):
-    return get_metric_scores(
-        model,
-        unlearning_teacher,
-        retain_train_dl,
-        retain_valid_dl,
-        forget_train_dl,
-        forget_valid_dl,
-        valid_dl,
-        device,
-    )
-
-
-def retrain(
-    model,
-    unlearning_teacher,
-    retain_train_dl,
-    retain_valid_dl,
-    forget_train_dl,
-    forget_valid_dl,
-    valid_dl,
-    dataset_name,
-    model_name,
-    device,
-    **kwargs,
-):
-    for layer in model.children():
-        if hasattr(layer, "reset_parameters"):
-            layer.reset_parameters()
-    if model_name == "ViT":
-        epochs = getattr(conf, f"{dataset_name}_{model_name}_EPOCHS")
-        milestones = getattr(conf, f"{dataset_name}_{model_name}_MILESTONES")
-    else:
-        epochs = getattr(conf, f"{dataset_name}_EPOCHS")
-        milestones = getattr(conf, f"{dataset_name}_MILESTONES")
-    _ = fit_one_cycle(
-        epochs,
-        model,
-        retain_train_dl,
-        retain_valid_dl,
-        milestones=milestones,
-        device=device,
-    )
-
-    return get_metric_scores(
-        model,
-        unlearning_teacher,
-        retain_train_dl,
-        retain_valid_dl,
-        forget_train_dl,
-        forget_valid_dl,
-        valid_dl,
-        device,
-    )
+# Set seeds
+torch.manual_seed(args.seed)
+np.random.seed(args.seed)
+random.seed(args.seed)
 
 
-def finetune(
-    model,
-    unlearning_teacher,
-    retain_train_dl,
-    retain_valid_dl,
-    forget_train_dl,
-    forget_valid_dl,
-    valid_dl,
-    device,
-    **kwargs,
-):
-    _ = fit_one_cycle(
-        5, model, retain_train_dl, retain_valid_dl, lr=0.02, device=device
-    )
+batch_size = args.b
 
-    return get_metric_scores(
-        model,
-        unlearning_teacher,
-        retain_train_dl,
-        retain_valid_dl,
-        forget_train_dl,
-        forget_valid_dl,
-        valid_dl,
-        device,
-    )
+# get network
+net = getattr(models, args.net)(num_classes=args.classes)
+net.load_state_dict(torch.load(args.weight_path))
+
+unlearning_teacher = getattr(models, args.net)(num_classes=args.classes)
+
+if args.gpu:
+    net = net.cuda()
+    unlearning_teacher = unlearning_teacher.cuda()
 
 
-def blindspot(
-    model,
-    unlearning_teacher,
-    retain_train_dl,
-    retain_valid_dl,
-    forget_train_dl,
-    forget_valid_dl,
-    valid_dl,
-    device,
-    **kwargs,
-):
-    student_model = deepcopy(model)
-    KL_temperature = 1
-    optimizer = torch.optim.Adam(student_model.parameters(), lr=0.0001)
-    retain_train_subset = random.sample(
-        retain_train_dl.dataset, int(0.3 * len(retain_train_dl.dataset))
-    )
-
-    if kwargs["model_name"] == "ViT":
-        b_s = 128  # lowered batch size from 256 (original) to fit into memory
-    else:
-        b_s = 256
-
-    blindspot_unlearner(
-        model=student_model,
-        unlearning_teacher=unlearning_teacher,
-        full_trained_teacher=model,
-        retain_data=retain_train_subset,
-        forget_data=forget_train_dl.dataset,
-        epochs=1,
-        optimizer=optimizer,
-        lr=0.0001,
-        batch_size=b_s,
-        device=device,
-        KL_temperature=KL_temperature,
-    )
-
-    return get_metric_scores(
-        student_model,
-        unlearning_teacher,
-        retain_train_dl,
-        retain_valid_dl,
-        forget_train_dl,
-        forget_valid_dl,
-        valid_dl,
-        device,
-    )
+root = "105_classes_pins_dataset" if args.dataset == "PinsFaceRecognition" else "./data"
 
 
-def amnesiac(
-    model,
-    unlearning_teacher,
-    retain_train_dl,
-    retain_valid_dl,
-    forget_train_dl,
-    forget_valid_dl,
-    valid_dl,
-    num_classes,
-    device,
-    **kwargs,
-):
-    unlearninglabels = list(range(num_classes))
-    unlearning_trainset = []
+img_size = 224 if args.net == "ViT" else 32
+trainset = getattr(datasets, args.dataset)(
+    root=root, download=True, train=True, unlearning=True, img_size=img_size
+)
+validset = getattr(datasets, args.dataset)(
+    root=root, download=True, train=False, unlearning=True, img_size=img_size
+)
 
-    for x, _, clabel in forget_train_dl.dataset:
-        rnd = random.choice(unlearninglabels)
-        while rnd == clabel:
-            rnd = random.choice(unlearninglabels)
-        unlearning_trainset.append((x, _, rnd))
+trainloader = DataLoader(trainset, num_workers=4, batch_size=args.b, shuffle=True)
+validloader = DataLoader(validset, num_workers=4, batch_size=args.b, shuffle=False)
+forget_train, retain_train = torch.utils.data.random_split(
+    trainset, [args.forget_perc, 1 - args.forget_perc]
+)
+forget_train_dl = DataLoader(list(forget_train), batch_size=128)
+retain_train_dl = DataLoader(list(retain_train), batch_size=128, shuffle=True)
+forget_valid_dl = forget_train_dl
+retain_valid_dl = validloader
 
-    for x, _, y in retain_train_dl.dataset:
-        unlearning_trainset.append((x, _, y))
-
-    unlearning_train_set_dl = DataLoader(
-        unlearning_trainset, 128, pin_memory=True, shuffle=True
-    )
-
-    _ = fit_one_unlearning_cycle(
-        3, model, unlearning_train_set_dl, retain_valid_dl, device=device, lr=0.0001
-    )
-    return get_metric_scores(
-        model,
-        unlearning_teacher,
-        retain_train_dl,
-        retain_valid_dl,
-        forget_train_dl,
-        forget_valid_dl,
-        valid_dl,
-        device,
-    )
+# Change alpha here as described in the paper
+model_size_scaler = 1
+if args.net == "ViT":
+    model_size_scaler = 1
+else:
+    model_size_scaler = 1
 
 
-def FisherForgetting(
-    model,
-    unlearning_teacher,
-    retain_train_dl,
-    retain_valid_dl,
-    forget_train_dl,
-    forget_valid_dl,
-    valid_dl,
-    num_classes,
-    device,
-    **kwargs,
-):
-    def hessian(dataset, model):
-        model.eval()
-        train_loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
-        loss_fn = nn.CrossEntropyLoss()
+full_train_dl = DataLoader(
+    ConcatDataset((retain_train_dl.dataset, forget_train_dl.dataset)),
+    batch_size=batch_size,
+)
 
-        for p in model.parameters():
-            p.grad_acc = 0
-            p.grad2_acc = 0
+kwargs = {
+    "model": net,
+    "unlearning_teacher": unlearning_teacher,
+    "retain_train_dl": retain_train_dl,
+    "retain_valid_dl": retain_valid_dl,
+    "forget_train_dl": forget_train_dl,
+    "forget_valid_dl": forget_valid_dl,
+    "full_train_dl": full_train_dl,
+    "valid_dl": validloader,
+    "dampening_constant": 1,
+    "selection_weighting": 10 * model_size_scaler,
+    "num_classes": args.classes,
+    "dataset_name": args.dataset,
+    "device": "cuda" if args.gpu else "cpu",
+    "model_name": args.net,
+}
 
-        for data, _, orig_target in tqdm(train_loader):
-            data, orig_target = data.to(device), orig_target.to(device)
-            output = model(data)
-            prob = F.softmax(output, dim=-1).data
-
-            for y in range(output.shape[1]):
-                target = torch.empty_like(orig_target).fill_(y)
-                loss = loss_fn(output, target)
-                model.zero_grad()
-                loss.backward(retain_graph=True)
-                for p in model.parameters():
-                    if p.requires_grad:
-                        p.grad_acc += (orig_target == target).float() * p.grad.data
-                        p.grad2_acc += prob[:, y] * p.grad.data.pow(2)
-
-        for p in model.parameters():
-            p.grad_acc /= len(train_loader)
-            p.grad2_acc /= len(train_loader)
-
-    def get_mean_var(p, is_base_dist=False, alpha=3e-6):
-        var = deepcopy(1.0 / (p.grad2_acc + 1e-8))
-        var = var.clamp(max=1e3)
-        if p.size(0) == num_classes:
-            var = var.clamp(max=1e2)
-        var = alpha * var
-
-        if p.ndim > 1:
-            var = var.mean(dim=1, keepdim=True).expand_as(p).clone()
-        if not is_base_dist:
-            mu = deepcopy(p.data0.clone())
-        else:
-            mu = deepcopy(p.data0.clone())
-        if p.ndim == 1:
-            # BatchNorm
-            var *= 10
-        #         var*=1
-        return mu, var
-
-    for p in model.parameters():
-        p.data0 = deepcopy(p.data.clone())
-
-    hessian(retain_train_dl.dataset, model)
-
-    fisher_dir = []
-    alpha = 1e-6
-    for i, p in enumerate(model.parameters()):
-        mu, var = get_mean_var(p, False, alpha=alpha)
-        p.data = mu + var.sqrt() * torch.empty_like(p.data0).normal_()
-        fisher_dir.append(var.sqrt().view(-1).cpu().detach().numpy())
-    return get_metric_scores(
-        model,
-        unlearning_teacher,
-        retain_train_dl,
-        retain_valid_dl,
-        forget_train_dl,
-        forget_valid_dl,
-        valid_dl,
-        device,
-    )
+wandb.init(
+    project=f"R1_{args.net}_{args.dataset}_random_{args.forget_perc}perc",
+    name=f"{args.method}",
+)
 
 
-def ssd_tuning(
-    model,
-    unlearning_teacher,
-    retain_train_dl,
-    retain_valid_dl,
-    forget_train_dl,
-    forget_valid_dl,
-    valid_dl,
-    dampening_constant,
-    selection_weighting,
-    full_train_dl,
-    device,
-    **kwargs,
-):
-    parameters = {
-        "lower_bound": 1,
-        "exponent": 1,
-        "magnitude_diff": None,
-        "min_layer": -1,
-        "max_layer": -1,
-        "forget_threshold": 1,
-        "dampening_constant": dampening_constant,
-        "selection_weighting": selection_weighting,
+# wandb.init(project=f"{args.dataset}_forget_random_{args.forget_perc}", name=f'{args.method}')
+
+start = time.time()
+
+testacc, retainacc, forgetacc, zrf, mia = getattr(forget_random_strategies, args.method)(**kwargs)
+
+end = time.time()
+time_elapsed = end - start
+
+print(testacc, retainacc, forgetacc, zrf, mia)
+
+wandb.log(
+    {
+        "TestAcc": testacc,
+        "RetainTestAcc": retainacc,
+        "ForgetAcc": forgetacc,  # Explicitly log Forget Accuracy
+        "ZRF": zrf,
+        "MIA": mia,
+        "model_scaler": model_size_scaler,
+        "MethodTime": time_elapsed,  # Exclude baseline time if needed
     }
+)
 
-    # load the trained model
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+wandb.finish()
 
-    ssd_t = ssd.ParameterPerturber(model, optimizer, device, parameters)
-    model = model.eval()
-
-    sample_importances = ssd_t.calc_importance(forget_train_dl)
-
-    original_importances = ssd_t.calc_importance(full_train_dl)
-    ssd_t.modify_weight(original_importances, sample_importances)
-    return get_metric_scores(
-        model,
-        unlearning_teacher,
-        retain_train_dl,
-        retain_valid_dl,
-        forget_train_dl,
-        forget_valid_dl,
-        valid_dl,
-        device,
-    )
-
-def mu_mis_ssd_tuning(
-    model,
-    unlearning_teacher,
-    retain_train_dl,
-    retain_valid_dl,
-    forget_train_dl,
-    forget_valid_dl,
-    valid_dl,
-    dampening_constant,
-    selection_weighting,
-    full_train_dl,
-    device,
-    **kwargs,
-):
-    max_epochs=20
-    parameters = {
-        "lower_bound": 1,
-        "exponent": 1,
-        "magnitude_diff": None,
-        "min_layer": -1,
-        "max_layer": -1,
-        "forget_threshold": 1,
-        "dampening_constant": dampening_constant,
-        "selection_weighting": selection_weighting,
-    }
-
-    print("🔹 Improved MU MIS SSD Tuning")
-
-    optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=1e-5)
-
-    ssd_t = ssd.ParameterPerturber(model, optimizer, device, parameters)
-    importance_forget = ssd_t.calc_importance(forget_train_dl)
-    importance_full = ssd_t.calc_importance(full_train_dl)
-
-    w_p = deepcopy(model.state_dict())
-    prev_loss = float("inf")
-    delta_threshold = 1e-3  # Stopping criteria
-    epoch = 0
-
-    while epoch < max_epochs:
-        print(f"\n🔄 Epoch {epoch + 1} ----------------------")
-        delta_w = {key: torch.zeros_like(param) for key, param in model.state_dict().items()}
-        fisher_info = {key: torch.zeros_like(param) for key, param in model.state_dict().items()}
-
-        model.train()
-        for batch in forget_train_dl:
-            inputs, _, labels = batch
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = torch.nn.functional.cross_entropy(outputs, labels)
-            loss.backward()
-
-            for key, param in model.named_parameters():
-                hessian_term = 0.5 * torch.norm(param.grad) ** 2  # Hessian Approx
-                fisher_info[key] += torch.norm(param.grad) ** 2  # Fisher Information
-                delta_w[key] += importance_forget[key] * (param.grad + hessian_term)
-
-        print("✅ Gradient updates computed.")
-
-        with torch.no_grad():
-            for key, param in model.named_parameters():
-                fisher_scaling = torch.exp(-fisher_info[key])
-                delta_w[key] *= fisher_scaling  # Adaptive Forgetting Scaling
-                param -= 0.1 * delta_w[key]  # Learning Rate applied
-                param.copy_(torch.clamp(param, -0.5, 0.5))  # Trust Region Constraint
-
-        print("🔧 Model weights updated.")
-        model.eval()
-
-        total_loss = 0.0
-        num_batches = 0
-        with torch.no_grad():
-            for batch in valid_dl:
-                images, _, labels = batch
-                images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                loss = torch.nn.functional.cross_entropy(outputs, labels)
-                total_loss += loss.item()
-                num_batches += 1
-
-        new_loss = total_loss / num_batches
-        print(f"📉 Validation Loss: {new_loss:.6f} (Previous: {prev_loss:.6f})")
-
-        if abs(prev_loss - new_loss) < delta_threshold:
-            print("✅ Convergence reached. Stopping...")
-            break
-
-        prev_loss = new_loss
-        scheduler.step()
-        epoch += 1
-
-    print("🏁 Training complete.")
-    return get_metric_scores(model, unlearning_teacher, retain_train_dl, retain_valid_dl, forget_train_dl, forget_valid_dl, valid_dl, device)
