@@ -40,9 +40,6 @@ def get_metric_scores(
     # Retain set accuracy
     retain_acc_dict = evaluate(model, retain_valid_dl, device)  
 
-    # Forget set accuracy
-    forget_acc_dict = evaluate(model, forget_valid_dl, device)
-
     # Zero Retention Force (ZRF) score
     zrf = UnLearningScore(model, unlearning_teacher, forget_valid_dl, 128, device)
 
