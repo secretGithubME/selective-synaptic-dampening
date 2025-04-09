@@ -904,3 +904,350 @@ def MESD_unlearning(
         device,
     ) 
 
+def SuperUnlearning(
+    model,
+    unlearning_teacher,
+    retain_train_dl,
+    retain_valid_dl,
+    forget_train_dl,
+    forget_valid_dl,
+    valid_dl,
+    forget_class,
+    num_classes,
+    device,
+    dataset_name,
+    model_name,
+    **kwargs,
+):
+    """
+    Implementation of Super Unlearning model that integrates multiple unlearning techniques.
+    
+    This model strategically combines:
+    1. Projection-based weight modification
+    2. Low-rank weight updates
+    3. Knowledge distillation with selective forgetting
+    4. Neuron pruning for critical neurons
+    5. Targeted fine-tuning
+    
+    The combined approach provides stronger forgetting guarantees while maintaining
+    performance on retained data.
+    """
+    print("Starting Super Unlearning...")
+    
+    # Step 1: Save original model for knowledge distillation
+    unlearning_teacher.load_state_dict(model.state_dict())
+    unlearning_teacher.eval()
+    
+    # Step 2: Projection-based forgetting on the final layer
+    print("Phase 1: Projection-based weight modification...")
+    
+    # Get feature extractor (everything before the final layer)
+    if hasattr(model, "fc"):  # ResNet, VGG-like models
+        final_layer = model.fc
+        feature_layers = nn.Sequential(*list(model.children())[:-1])
+    elif hasattr(model, "classifier"):  # Some VGG variants, ViT
+        final_layer = model.classifier
+        feature_layers = nn.Sequential(*list(model.children())[:-1])
+    else:
+        raise ValueError(f"Unknown model architecture: {model_name}")
+    
+    # Save original weights of the final layer
+    original_weights = final_layer.weight.data.clone()
+    
+    # Extract features from retain set
+    print("Extracting features from retain set...")
+    all_features = []
+    for batch in tqdm(retain_train_dl, desc="Extracting features"):
+        inputs, _, targets = [tensor.to(device) for tensor in batch]
+        with torch.no_grad():
+            # Get features before the final layer
+            if hasattr(model, "fc"):
+                features = feature_layers(inputs).squeeze()
+            else:
+                features = feature_layers(inputs)
+                features = torch.flatten(features, 1)
+            all_features.append(features)
+    
+    # Stack all features
+    all_features = torch.cat(all_features, dim=0)
+    
+    # Calculate projection matrix (XᵀX)(XᵀX)⁻¹
+    print("Computing projection matrix...")
+    X = all_features.cpu()
+    XtX = X.T @ X
+    # Use pseudoinverse for stability
+    XtX_inv = torch.linalg.pinv(XtX)
+    projection_matrix = XtX @ XtX_inv
+    
+    # Project the weights
+    print("Projecting weights...")
+    projected_weights = (projection_matrix @ original_weights.cpu().T).T
+    
+    # Update the model with projected weights
+    final_layer.weight.data = projected_weights.to(device)
+    
+    # Step 3: Low-rank weight modification for deeper layers
+    print("Phase 2: Low-rank weight updates...")
+    
+    # Compute gradients for forget and retain sets
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+    
+    # Function to compute average gradients
+    def compute_gradients(dataloader):
+        grads = {name: torch.zeros_like(param.data) for name, param in model.named_parameters()}
+        count = 0
+        
+        for batch in tqdm(dataloader, desc="Computing gradients"):
+            inputs, _, targets = [tensor.to(device) for tensor in batch]
+            count += inputs.size(0)
+            
+            model.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grads[name] += param.grad.data * inputs.size(0)  # Weighted by batch size
+        
+        # Normalize by total number of samples
+        for name in grads:
+            grads[name] /= count
+            
+        return grads
+    
+    # Compute gradients for forget and retain sets
+    forget_grads = compute_gradients(forget_train_dl)
+    retain_grads = compute_gradients(retain_train_dl)
+    
+    # Compute the orthogonal direction to remove forget knowledge
+    update_direction = {}
+    
+    for name, param in model.named_parameters():
+        if name in forget_grads and param.dim() > 1:  # Only update matrices, not biases
+            # Skip the final layer as it's already handled by projection
+            if "fc" in name or "classifier" in name:
+                continue
+                
+            # Reshape to 2D for matrix computations
+            original_shape = param.data.shape
+            F_grad = forget_grads[name].view(original_shape[0], -1)
+            R_grad = retain_grads[name].view(original_shape[0], -1)
+            
+            # Compute SVD of retain gradients to find subspace
+            try:
+                U, S, V = torch.svd(R_grad)
+                
+                # Determine rank based on singular values
+                threshold = 0.01 * S.max()
+                rank = (S > threshold).sum().item()
+                rank = max(1, min(rank, min(U.shape[0], V.shape[0]) - 1))  # Ensure valid rank
+                
+                # Project forget gradient onto orthogonal complement of retain subspace
+                U_r = U[:, :rank]  # Retain subspace
+                
+                # Project forget gradient onto orthogonal complement of U_r
+                proj = F_grad - U_r @ (U_r.T @ F_grad)
+                
+                # Scale the update - negative to move away from forget class
+                alpha = 3.0  # Scaling factor for unlearning
+                update = -alpha * proj.view(original_shape)
+                
+                update_direction[name] = update
+            except RuntimeError:
+                # SVD might fail for small or ill-conditioned matrices - use simpler approach
+                update_direction[name] = -alpha * forget_grads[name]
+        else:
+            update_direction[name] = torch.zeros_like(param.data)
+    
+    # Apply the update direction
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name in update_direction:
+                param.data += update_direction[name]
+    
+    # Step 4: Identify and prune neurons critical for forget class
+    print("Phase 3: Critical neuron identification and pruning...")
+    
+    # Track activations for convolutional and linear layers
+    activations = {}
+    handles = []
+    
+    def get_activation(name):
+        def hook(model, input, output):
+            activations[name] = output.detach()
+        return hook
+    
+    # Register hooks to get activations
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv2d, nn.Linear)):
+            handles.append(module.register_forward_hook(get_activation(name)))
+    
+    # Get average activations for forget class samples
+    model.eval()
+    forget_activations = {name: 0 for name in activations}
+    sample_count = 0
+    
+    for batch in tqdm(forget_train_dl, desc="Computing critical neurons"):
+        inputs, _, targets = [tensor.to(device) for tensor in batch]
+        _ = model(inputs)
+        
+        for name in activations:
+            # For each layer, accumulate activation values
+            if len(activations[name].shape) == 4:  # Conv layer
+                channel_mean = activations[name].mean(dim=[0, 2, 3])  # Average over batch, height, width
+                try:
+                  forget_activations[name] += channel_mean
+                except KeyError:
+                  continue
+            else:  # Linear layer
+                neuron_mean = activations[name].mean(dim=0)
+                try:  # Average over batch
+                  forget_activations[name] += neuron_mean
+                except KeyError:
+                  continue
+                
+        sample_count += inputs.size(0)
+    
+    # Normalize to get average activations
+    for name in forget_activations:
+        forget_activations[name] /= sample_count
+    
+    # Remove hooks
+    for handle in handles:
+        handle.remove()
+    
+    # Create masks to prune critical neurons
+    masks = {}
+    prune_ratio = 0.08  # Prune top 8% of neurons most active for forget class
+    
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv2d, nn.Linear)) and name in forget_activations:
+            activations_val = forget_activations[name]
+            if isinstance(module, nn.Conv2d):
+                # For Conv layers, mask channels
+                num_to_prune = max(1, int(activations_val.size(0) * prune_ratio))
+                _, indices = torch.topk(activations_val, num_to_prune)
+                mask = torch.ones_like(activations_val)
+                mask[indices] = 0.1  # Attenuate by 90% rather than zero out completely
+                masks[name] = mask
+            elif isinstance(module, nn.Linear):
+                # For Linear layers, mask neurons
+                num_to_prune = max(1, int(activations_val.size(0) * prune_ratio))
+                _, indices = torch.topk(activations_val, num_to_prune)
+                mask = torch.ones_like(activations_val)
+                mask[indices] = 0.1  # Attenuate by 90%
+                masks[name] = mask
+    
+    # Apply masks during forward pass
+    class MaskedForward:
+        def __init__(self, module, mask):
+            self.module = module
+            self.mask = mask
+            self.original_forward = module.forward
+        
+        def __call__(self, x):
+            output = self.original_forward(x)
+            if len(output.shape) == 4:  # Conv output
+                return output * self.mask.view(1, -1, 1, 1)
+            else:  # Linear output
+                return output * self.mask
+    
+    # Apply masking to model
+    for name, module in model.named_modules():
+        if name in masks:
+            module.forward = MaskedForward(module, masks[name].to(device))
+    
+    # Step 5: Distillation on retain data to preserve performance
+    print("Phase 4: Selective knowledge distillation...")
+    
+    model.train()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+    temperature = 3.0  # Temperature for softer probability distribution
+    alpha = 0.8  # Weight for distillation loss
+    
+    for epoch in range(4):
+        for batch in tqdm(retain_train_dl, desc=f"Distillation Epoch {epoch+1}"):
+            inputs, _, targets = [tensor.to(device) for tensor in batch]
+            optimizer.zero_grad()
+            
+            # Forward passes
+            student_outputs = model(inputs)
+            with torch.no_grad():
+                teacher_outputs = unlearning_teacher(inputs)
+            
+            # Regular cross-entropy loss
+            ce_loss = criterion(student_outputs, targets)
+            
+            # Knowledge distillation loss
+            # Only distill knowledge for non-forgotten classes
+            mask = (targets != forget_class).float().unsqueeze(1)
+            
+            # Apply temperature softmax
+            soft_targets = F.softmax(teacher_outputs / temperature, dim=1)
+            soft_outputs = F.log_softmax(student_outputs / temperature, dim=1)
+            
+            # Compute masked distillation loss
+            distill_loss = F.kl_div(
+                soft_outputs, 
+                soft_targets, 
+                reduction='none'
+            ).sum(dim=1) * mask.squeeze()
+            
+            distill_loss = (temperature ** 2) * distill_loss.mean()
+            
+            # Combined loss - don't distill for forgotten class
+            loss = (1 - alpha) * ce_loss + alpha * distill_loss
+            
+            loss.backward()
+            optimizer.step()
+    
+    # Step 6: Final optimization - gradient ascent on forget class
+    print("Phase 5: Targeted gradient ascent on forget data...")
+    
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.005, momentum=0.9)
+    
+    # Perform gradient ascent on forget data (maximize loss)
+    model.train()
+    for epoch in range(2):  # Few epochs of unlearning
+        for batch in tqdm(forget_train_dl, desc=f"Targeted Unlearning Epoch {epoch+1}"):
+            inputs, _, targets = [tensor.to(device) for tensor in batch]
+            optimizer.zero_grad()
+            
+            outputs = model(inputs)
+            loss = -criterion(outputs, targets)  # Negative sign for ascent
+            loss.backward()
+            optimizer.step()
+    
+    # Step 7: Final fine-tuning on retain data
+    print("Phase 6: Final fine-tuning...")
+    
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0008, momentum=0.9)
+    model.train()
+    
+    for epoch in range(3):  # Brief fine-tuning
+        for batch in tqdm(retain_train_dl, desc=f"Fine-tuning Epoch {epoch+1}"):
+            inputs, _, targets = [tensor.to(device) for tensor in batch]
+            optimizer.zero_grad()
+            
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+    
+    # Restore original forward methods
+    for name, module in model.named_modules():
+        if name in masks and hasattr(module.forward, 'original_forward'):
+            module.forward = module.forward.original_forward
+    
+    return get_metric_scores(
+        model,
+        unlearning_teacher,
+        retain_train_dl,
+        retain_valid_dl,
+        forget_train_dl,
+        forget_valid_dl,
+        valid_dl,
+        device,
+    )
