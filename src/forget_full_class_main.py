@@ -72,9 +72,7 @@ parser.add_argument(
         "UNSIR",
         "NTK",
         "ssd_tuning",
-        "mu_mis_ssd_tuning",
-        "MESD_unlearning",
-        "mu_mis_unlearning"
+        "SuperUnlearning"
     ],
     help="select unlearning method from choice set",
 )
