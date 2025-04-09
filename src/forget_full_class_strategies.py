@@ -1251,3 +1251,171 @@ def SuperUnlearning(
         valid_dl,
         device,
     )
+
+def NegativeKnowledgeTransferUnlearning(
+    model,
+    unlearning_teacher,
+    retain_train_dl,
+    retain_valid_dl,
+    forget_train_dl,
+    forget_valid_dl,
+    valid_dl,
+    forget_class,
+    num_classes,
+    device,
+    **kwargs,
+):
+    """
+    Negative Knowledge Transfer Unlearning.
+
+    This method unlearns specific target classes by:
+    1. Training a negative model to *misclassify* forget-class data.
+    2. Transferring the 'anti-knowledge' (negative weights) to the base model.
+    3. Recovering accuracy on retained classes via knowledge distillation.
+    4. Final fine-tuning and adversarial reinforcement on forget data.
+
+    Args:
+        model: The original model to be unlearned.
+        unlearning_teacher: A frozen copy for knowledge distillation.
+        *_dl: DataLoaders for different data partitions.
+        forget_class: Class label(s) to forget.
+        num_classes: Total number of classes.
+        device: Torch device.
+    """
+    import torch.nn.functional as F
+    from torch.optim.lr_scheduler import StepLR
+
+    print("=== Phase 1: Negative Knowledge Acquisition ===")
+
+    negative_model = copy.deepcopy(model).to(device)
+    original_state = copy.deepcopy(model.state_dict())
+    criterion = nn.CrossEntropyLoss()
+
+    def create_incorrect_targets(targets):
+        incorrect = targets.clone()
+        for i, true_label in enumerate(targets):
+            options = list(range(num_classes))
+            options.remove(true_label.item())
+            incorrect[i] = random.choice(options)
+        return incorrect
+
+    optimizer = torch.optim.SGD(negative_model.parameters(), lr=0.01, momentum=0.9)
+    scheduler = StepLR(optimizer, step_size=2, gamma=0.7)
+
+    negative_model.train()
+    for epoch in range(5):
+        for inputs, _, targets in tqdm(forget_train_dl, desc=f"NegTrain {epoch+1}"):
+            inputs, targets = inputs.to(device), targets.to(device)
+            incorrect = create_incorrect_targets(targets)
+
+            optimizer.zero_grad()
+            outputs = negative_model(inputs)
+            loss = criterion(outputs, incorrect)
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+
+    print("=== Phase 2: Transferring Anti-Knowledge ===")
+
+    negative_delta = {
+        k: negative_model.state_dict()[k] - original_state[k]
+        for k in model.state_dict()
+        if k in negative_model.state_dict()
+    }
+
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name in negative_delta:
+                param.data += 0.7 * negative_delta[name]
+
+    print("=== Phase 3: Forget Accuracy Evaluation ===")
+
+    model.eval()
+    total, correct, loss_total = 0, 0, 0.0
+    with torch.no_grad():
+        for inputs, _, targets in forget_valid_dl:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss_total += loss.item()
+            _, preds = outputs.max(1)
+            correct += preds.eq(targets).sum().item()
+            total += targets.size(0)
+
+    print(f"Forget Class Accuracy After Transfer: {100. * correct / total:.2f}%")
+
+    print("=== Phase 4: Knowledge Distillation for Retain Classes ===")
+
+    unlearning_teacher.load_state_dict(original_state)
+    unlearning_teacher.eval()
+
+    model.train()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+    scheduler = StepLR(optimizer, step_size=2, gamma=0.7)
+
+    alpha, T = 0.9, 4.0
+
+    for epoch in range(4):
+        for inputs, _, targets in tqdm(retain_train_dl, desc=f"Distill {epoch+1}"):
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+
+            student_out = model(inputs)
+            with torch.no_grad():
+                teacher_out = unlearning_teacher(inputs)
+
+            ce_loss = criterion(student_out, targets)
+
+            soft_t = F.softmax(teacher_out / T, dim=1)
+            soft_s = F.log_softmax(student_out / T, dim=1)
+            mask = (targets != forget_class).float().unsqueeze(1)
+
+            distill_loss = F.kl_div(soft_s, soft_t, reduction='none').sum(dim=1)
+            distill_loss = (T ** 2) * (distill_loss * mask.squeeze()).mean()
+
+            loss = (1 - alpha) * ce_loss + alpha * distill_loss
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+
+    print("=== Phase 5: Final Retain Fine-tuning ===")
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0005, momentum=0.9)
+
+    model.train()
+    for epoch in range(2):
+        for inputs, _, targets in tqdm(retain_train_dl, desc=f"FineTune {epoch+1}"):
+            inputs, targets = inputs.to(device), targets.to(device)
+            mask = targets != forget_class
+            if not torch.any(mask): continue
+            inputs, targets = inputs[mask], targets[mask]
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+
+    print("=== Phase 6: Adversarial Reinforcement on Forget Data ===")
+
+    model.train()
+    for inputs, _, targets in tqdm(forget_train_dl, desc="Adversarial"):
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = -criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+    print("=== Final Evaluation ===")
+    return get_metric_scores(
+        model,
+        unlearning_teacher,
+        retain_train_dl,
+        retain_valid_dl,
+        forget_train_dl,
+        forget_valid_dl,
+        valid_dl,
+        device,
+    )
+
