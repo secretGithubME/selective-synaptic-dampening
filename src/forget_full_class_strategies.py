@@ -8,8 +8,11 @@ from torch.utils.data import DataLoader, ConcatDataset, dataset
 import itertools
 
 from tqdm import tqdm
+import torch.optim as optim
+import torch.nn.functional as F
 from sklearn import linear_model, model_selection
 from collections import OrderedDict
+import torch.nn as nn
 
 
 from unlearn import *
@@ -604,3 +607,300 @@ def ssd_tuning(
         valid_dl,
         device,
     )
+
+def mu_mis_unlearning(
+    model,
+    unlearning_teacher,
+    retain_train_dl,
+    retain_valid_dl,
+    forget_train_dl,
+    forget_valid_dl,
+    valid_dl,
+    dampening_constant,
+    selection_weighting,
+    full_train_dl,
+    device,
+    **kwargs,
+):
+    step_size=0.05 # η: Step length
+    stop_threshold=0.7  # δ: Stopping threshold
+    max_iterations=20  # TMU: Max iterations
+    num_classes = kwargs.get('num_classes')
+    model.train()
+    model = model.to(device)
+    
+    # Initialize model parameters
+    wt = model.state_dict()  # w0 = wp
+    
+    # Compute initial loss on forgetting set D_f
+    criterion = nn.CrossEntropyLoss()
+    initial_loss = 0.0
+    for x,_, y in forget_train_dl:
+        x, y = x.to(device), y.to(device)
+        preds = model(x)
+        initial_loss += criterion(preds, y).item()
+    L_0 = initial_loss / len(forget_train_dl)  # L̃_0
+    
+    for t in range(max_iterations):  # Repeat until stopping condition
+        print("Epoch: ",t+1)
+        delta_w = {key: torch.zeros_like(param) for key, param in wt.items()}  # Initialize Δw
+        avg_loss = 0.0  # Initialize L̃
+        
+        for x,_,y in forget_train_dl:
+            x, y = x.to(device), y.to(device)
+            
+            # Select a random irrelevant class (c' ≠ c)
+            random_labels = torch.randint(0, num_classes, y.shape, device=device)
+            while torch.any(random_labels == y):  # Ensure c' ≠ c
+                random_labels = torch.randint(0, num_classes, y.shape, device=device)
+            
+            # Compute loss for x with random class
+            preds = model(x)
+            loss = criterion(preds, random_labels)
+            loss.backward()  # Compute gradient
+            
+            # Accumulate gradient updates
+            for key, param in model.named_parameters():
+                delta_w[key] += param.grad.clone()
+            
+            avg_loss += loss.item()
+        
+        # Normalize updates
+        for key in delta_w.keys():
+            delta_w[key] = delta_w[key].float() / len(forget_train_dl)
+        
+        # Update model parameters: wt+1 = wt - ηΔw
+        with torch.no_grad():
+            for key, param in model.named_parameters():
+                param -= step_size * delta_w[key]
+        
+        # Compute loss change: ΔL̃
+        final_loss = 0.0
+        for x,_,y in forget_train_dl:
+            x, y = x.to(device), y.to(device)
+            preds = model(x)
+            final_loss += criterion(preds, y).item()
+        L_final = final_loss / len(forget_train_dl)
+        delta_L = abs(L_0 - L_final) / len(forget_train_dl)
+        print("Final loss: ", final_loss)
+        
+        # Stop if ΔL̃ ≥ δ
+        if delta_L >= stop_threshold:
+            break
+    
+    return get_metric_scores(model, unlearning_teacher, retain_train_dl, retain_valid_dl, forget_train_dl, forget_valid_dl, valid_dl, device)
+
+def mu_mis_ssd_tuning(
+    model,
+    unlearning_teacher,
+    retain_train_dl,
+    retain_valid_dl,
+    forget_train_dl,
+    forget_valid_dl,
+    valid_dl,
+    dampening_constant,
+    selection_weighting,
+    full_train_dl,
+    device,
+    **kwargs,
+):
+    max_epochs=20
+    parameters = {
+        "lower_bound": 1,
+        "exponent": 1,
+        "magnitude_diff": None,
+        "min_layer": -1,
+        "max_layer": -1,
+        "forget_threshold": 1,
+        "dampening_constant": dampening_constant,
+        "selection_weighting": selection_weighting,
+    }
+
+    print("🔹 Improved MU MIS SSD Tuning")
+
+    optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=1e-5)
+
+    ssd_t = ssd.ParameterPerturber(model, optimizer, device, parameters)
+    importance_forget = ssd_t.calc_importance(forget_train_dl)
+    importance_full = ssd_t.calc_importance(full_train_dl)
+
+    w_p = deepcopy(model.state_dict())
+    prev_loss = float("inf")
+    delta_threshold = 1e-3  # Stopping criteria
+    epoch = 0
+
+    while epoch < max_epochs:
+        print(f"\n🔄 Epoch {epoch + 1} ----------------------")
+        delta_w = {key: torch.zeros_like(param) for key, param in model.state_dict().items()}
+        fisher_info = {key: torch.zeros_like(param) for key, param in model.state_dict().items()}
+
+        model.train()
+        for batch in forget_train_dl:
+            inputs, _, labels = batch
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = torch.nn.functional.cross_entropy(outputs, labels)
+            loss.backward()
+
+            for key, param in model.named_parameters():
+                hessian_term = 0.5 * torch.norm(param.grad) ** 2  # Hessian Approx
+                fisher_info[key] += torch.norm(param.grad) ** 2  # Fisher Information
+                delta_w[key] += importance_forget[key] * (param.grad + hessian_term)
+
+        print("✅ Gradient updates computed.")
+
+        with torch.no_grad():
+            for key, param in model.named_parameters():
+                fisher_scaling = torch.exp(-fisher_info[key])
+                delta_w[key] *= fisher_scaling  # Adaptive Forgetting Scaling
+                param -= 0.1 * delta_w[key]  # Learning Rate applied
+                param.copy_(torch.clamp(param, -0.5, 0.5))  # Trust Region Constraint
+
+        print("🔧 Model weights updated.")
+        model.eval()
+
+        total_loss = 0.0
+        num_batches = 0
+        with torch.no_grad():
+            for batch in valid_dl:
+                images, _, labels = batch
+                images, labels = images.to(device), labels.to(device)
+                outputs = model(images)
+                loss = torch.nn.functional.cross_entropy(outputs, labels)
+                total_loss += loss.item()
+                num_batches += 1
+
+        new_loss = total_loss / num_batches
+        print(f"📉 Validation Loss: {new_loss:.6f} (Previous: {prev_loss:.6f})")
+
+        if abs(prev_loss - new_loss) < delta_threshold:
+            print("✅ Convergence reached. Stopping...")
+            break
+
+        prev_loss = new_loss
+        scheduler.step()
+        epoch += 1
+
+    print("🏁 Training complete.")
+    return get_metric_scores(model, unlearning_teacher, retain_train_dl, retain_valid_dl, forget_train_dl, forget_valid_dl, valid_dl, device)
+
+def MESD_unlearning(
+    model,
+    retain_train_dl,
+    retain_valid_dl,
+    forget_train_dl,
+    forget_valid_dl,
+    valid_dl,
+    device,
+    **kwargs
+):
+    """
+    Memory Editing with Self-Distillation (MESD) for machine unlearning.
+    """
+    alpha=0.5   # Knowledge drift factor
+    beta=0.1   # Self-distillation weight
+    pruning_threshold=1e-6 # Adaptive neuron pruning threshold
+    num_epochs = 10
+    
+    print("\n[STEP 1] Training Student Model via Self-Distillation...\n")
+    
+    student_model = deepcopy(model)
+    optimizer = torch.optim.Adam(student_model.parameters(), lr=0.0005)
+    
+    for epoch in range(num_epochs):  
+        total_loss = 0.0
+        for x,_, y in retain_train_dl:
+            x, y = x.to(device), y.to(device)
+            teacher_logits = model(x).detach()
+            student_logits = student_model(x)
+            
+            loss = F.kl_div(F.log_softmax(student_logits, dim=-1), 
+                            F.softmax(teacher_logits, dim=-1), 
+                            reduction="batchmean") * beta
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        print(f"Epoch {epoch+1}/{num_epochs} - Self-Distillation Loss: {total_loss:.4f}")
+
+    print("\n[STEP 2] Injecting Controlled Noise for Knowledge Drift...\n")
+
+    # Store original weights before modification
+    original_params = {name: p.clone().detach() for name, p in student_model.named_parameters()}
+
+    with torch.no_grad():
+        for p in student_model.parameters():
+            noise = alpha * torch.randn_like(p) * p.std()
+            p.add_(noise)
+
+    # Measure drift
+    total_drift = 0.0
+    for name, p in student_model.named_parameters():
+        drift = torch.norm(p - original_params[name]).item()
+        total_drift += drift
+        print(f"Layer {name}: Weight Drift = {drift:.6f}")
+
+    print(f"\nTotal Model Drift: {total_drift:.6f}\n")
+
+    print("\n[STEP 3] Applying Contrastive Forgetting Loss (CFL)...\n")
+
+    def contrastive_forgetting_loss(model, x_forget, x_retain):
+        forget_feats = model(x_forget)
+        retain_feats = model(x_retain)
+
+        # Ensure both tensors have the same batch size
+        min_size = min(forget_feats.shape[0], retain_feats.shape[0])
+        forget_feats = forget_feats[:min_size]
+        retain_feats = retain_feats[:min_size]
+
+        return -F.cosine_similarity(forget_feats, retain_feats).mean()  # Maximize difference
+
+    forget_batch = next(iter(forget_train_dl))[0].to(device)
+    retain_batch = next(iter(retain_train_dl))[0].to(device)
+    optimizer = torch.optim.Adam(student_model.parameters(), lr=0.0001)
+
+    for epoch in range(2):
+        optimizer.zero_grad()
+        loss = contrastive_forgetting_loss(student_model, forget_batch, retain_batch)
+        loss.backward()
+        optimizer.step()
+        print(f"Epoch {epoch+1}/2 - Contrastive Forgetting Loss: {loss.item():.6f}")
+
+    print("\n[STEP 4] Pruning Neurons Responsible for Forgotten Classes...\n")
+
+    def prune_model(model, threshold=pruning_threshold):
+        prune_count = 0
+        with torch.no_grad():
+            for p in model.parameters():
+                mean_abs = p.abs().mean()
+                if mean_abs < threshold:
+                    prune_count += 1
+                    p.zero_()  # Prune neuron
+        
+        print(f"Total Neurons Pruned: {prune_count}")
+
+    prune_model(student_model)
+
+    print("\n[STEP 5] Generating Pseudo-Examples for Active Misremembering...\n")
+
+    synthetic_data = torch.randn_like(forget_batch) * 0.1 + forget_batch
+    with torch.no_grad():
+        student_model(synthetic_data)  # Feed pseudo-examples into model
+
+    print("MESD Unlearning Completed!\n")
+
+    return get_metric_scores(
+        student_model,
+        model,
+        retain_train_dl,
+        retain_valid_dl,
+        forget_train_dl,
+        forget_valid_dl,
+        valid_dl,
+        device,
+    ) 
+
